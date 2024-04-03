@@ -1,0 +1,154 @@
+---
+stages:
+  - test
+  - build
+  - secure
+  - promote
+
+variables:
+  TUF_URL: https://tuf.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com
+  OIDC_ISSUER_URL: https://gitlab.com
+  COSIGN_FULCIO_URL: https://fulcio.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com
+  COSIGN_REKOR_URL: https://rekor-server.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com
+  COSIGN_MIRROR: https://tuf.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com
+  COSIGN_ROOT: https://tuf.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com/root.json
+  COSIGN_OIDC_ISSUER: https://gitlab.com
+  COSIGN_CERTIFICATE_OIDC_ISSUER: https://gitlab.com
+  SIGSTORE_FULCIO_URL: https://fulcio.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com
+  SIGSTORE_OIDC_ISSUER: https://gitlab.com
+  SIGSTORE_REKOR_URL: https://rekor-server.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com
+  REKOR_REKOR_SERVER: https://rekor-server.apps.cluster-dlmbs.dlmbs.sandbox2828.opentlc.com
+
+unit-test:
+  image: golang:latest
+  stage: test
+  script:
+    - go test -race $(go list ./... | grep -v /vendor/)
+
+verify-code-signature:
+  image:
+    name: ghcr.io/sigstore/gitsign:v0.10.1
+    entrypoint: ["/bin/bash", "-c"]
+  stage: build
+  variables:
+    COSIGN_YES: "true"
+  # Set the JWT token audiance and the name of the env variable
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: "sigstore"
+  before_script:
+    - gitsign initialize --mirror=$TUF_URL --root=$TUF_URL/root.json
+  script:
+    - gitsign verify --certificate-identity=veshanka@redhat.com --certificate-oidc-issuer=https://accounts.google.com HEAD
+
+
+docker-build:
+  needs:
+    - job: verify-code-signature
+  # Use the official docker image.
+  image: docker:cli
+  stage: build
+  services:
+    - docker:dind
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - docker build --pull -t "$DOCKER_IMAGE_NAME" .
+    - docker push "$DOCKER_IMAGE_NAME"
+
+# scan:
+#     stage: build
+#     script:
+#       - "curl -k -L -H \"Authorization: Bearer $ROX_API_TOKEN\" https://$ROX_CENTRAL_ENDPOINT/api/cli/download/roxctl-linux --output ./roxctl  "
+#       - chmod a+x ./roxctl
+#      - ./roxctl image scan -e $ROX_CENTRAL_ENDPOINT --force --image ${DOCKER_IMAGE_NAME}
+#      - ./roxctl image check -e $ROX_CENTRAL_ENDPOINT --image ${DOCKER_IMAGE_NAME}
+
+generate-provenance:
+  image: registry.access.redhat.com/ubi9:latest
+  stage: secure
+  script:
+    - ./scripts/generate.sh > predicate.json
+  artifacts:
+    paths:
+      - predicate.json
+
+sign-and-attest:
+  needs:
+    - job: generate-provenance
+      artifacts: true
+  image:
+    name: ghcr.io/sigstore/cosign/cosign:v2.2.3-dev@sha256:0d795fa145b03026b7bc2a35e33068cdb75e1c1f974e604c17408bf7bd174967
+    entrypoint: ["/busybox/sh", "-c"]
+  stage: secure
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    COSIGN_YES: "true"
+  # Set the JWT token audiance and the name of the env variable
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: "sigstore"
+  before_script:
+    - cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    - cosign initialize
+  script:
+    - cosign sign ${DOCKER_IMAGE_NAME}
+    - cosign attest --predicate predicate.json --type https://slsa.dev/provenance/v1 ${DOCKER_IMAGE_NAME}
+
+verify-signature:
+  image:
+    name: ghcr.io/sigstore/cosign/cosign:v2.2.3-dev@sha256:0d795fa145b03026b7bc2a35e33068cdb75e1c1f974e604c17408bf7bd174967
+    entrypoint: ["/busybox/sh", "-c"]
+  stage: promote
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    COSIGN_YES: "true"
+  # Set the JWT token audiance and the name of the env variable
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: "sigstore"
+  before_script:
+    - cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    - cosign initialize
+  script:
+    - cosign verify --certificate-identity-regexp gitlab.com/veshanka1 --certificate-oidc-issuer-regexp gitlab.com ${DOCKER_IMAGE_NAME}
+
+ec-validate:
+  needs: [verify-signature]
+  image:
+    name: quay.io/enterprise-contract/ec-cli:snapshot
+    entrypoint: [""]
+  stage: promote
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    GIT_REVISION: $CI_COMMIT_SHA
+  before_script:
+    - cosign initialize
+  script:
+    - |
+      cat <<EOF | tee images.yaml
+      ---
+      components:
+        - containerImage: "${DOCKER_IMAGE_NAME}"
+          source:
+            git:
+              url: "${CI_PROJECT_URL}"
+              revision: "${GIT_REVISION}"
+      EOF
+    - ec validate image --images images.yaml --policy policy.yaml --output yaml --show-successes
+
+tag-latest:
+  needs: [ec-validate]
+  image:
+    name: ghcr.io/sigstore/cosign/cosign:v2.2.3-dev@sha256:0d795fa145b03026b7bc2a35e33068cdb75e1c1f974e604c17408bf7bd174967
+    entrypoint: ["/busybox/sh", "-c"]
+  stage: promote
+  variables:
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  before_script:
+    - cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+  script:
+    - cosign copy -f "${DOCKER_IMAGE_NAME}" "$CI_REGISTRY_IMAGE:latest"
+
